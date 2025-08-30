@@ -4,7 +4,6 @@ uvicorn
 torch --index-url https://download.pytorch.org/whl/cpu
 transformers
 accelerate
-logging
 # RAG를 위해 추가된 라이브러리
 sentence-transformers
 scikit-learn

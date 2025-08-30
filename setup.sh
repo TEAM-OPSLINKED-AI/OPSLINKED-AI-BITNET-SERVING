@@ -12,3 +12,8 @@ curl -X POST "http://localhost:8000/generate" \
      -d '{"prompt": "What is a Kubernetes Pod? Answer short"}'
 
 # Docker
+docker login
+
+docker build -t judemin/bitnet-fastapi:0.3 .
+
+docker push judemin/bitnet-fastapi:0.3
