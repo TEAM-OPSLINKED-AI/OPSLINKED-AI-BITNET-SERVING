@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+# CPU-only PyTorch for minimal size and resource usage
+torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+accelerate
+logging
+# RAG를 위해 추가된 라이브러리
+sentence-transformers
+scikit-learn
+numpy
+requests
+beautifulsoup4
+lxml
