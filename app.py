@@ -1,215 +1,248 @@
-from fastapi import FastAPI
+# ============================================================
+# app_fast.py — Optimized FastAPI RAG Server for AIOps Llama3
+# ============================================================
+
+import logging
+import time
+import os
+from typing import List, Dict
+
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-import requests
-from bs4 import BeautifulSoup
-import time
-import logging
+
+from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+
+# ============================================================
+# 초기 환경 설정
+# ============================================================
+load_dotenv()
+
+# Hugging Face 캐시 경로 지정 (속도 향상)
+os.environ["TRANSFORMERS_CACHE"] = "./hf_cache"
+os.makedirs("./hf_cache", exist_ok=True)
 
 logger = logging.getLogger("uvicorn.error")
 
-# -------------------------------------------------------------
-# 가장 가벼운 BitNet 모델 중 하나를 선택
-# -------------------------------------------------------------
-MODEL_NAME = "ighoshsubho/Bitnet-SmolLM-135M"
-# RAG의 검색을 위한 경량 임베딩 모델
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# ============================================================
+# 환경 변수 / DB 설정
+# ============================================================
+HF_TOKEN = os.environ.get("HF_TOKEN")
+if not HF_TOKEN:
+    logger.warning("⚠️ HF_TOKEN environment variable not found — gated model access may fail.")
 
-# -------------------------------------------------------------
-# 실시간 크롤링 대상 웹사이트 목록
-# AIOps 답변의 근거가 될 신뢰도 높은 기술 문서 및 블로그
-# -------------------------------------------------------------
-CRAWL_TARGET_URLS = [
-    # Kubernetes 공식 문서 (핵심 개념 및 디버깅)
-    "https://kubernetes.io/docs/concepts/overview/",
-    "https://kubernetes.io/docs/concepts/workloads/pods/",
-    "https://kubernetes.io/docs/concepts/services-networking/service/",
-    "https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/",
-    "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
-    # Prometheus Node Exporter (Linux 노드 메트릭)
-    "https://prometheus.io/docs/guides/node-exporter/",
-    # Spring Boot Actuator (애플리케이션 메트릭)
-    "https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html"
-]
+MONGO_URI = "mongodb://root:NYdrCjppRgNRdatI@121.138.215.117:27017/?authSource=admin"
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["metrics_db"]
+mysql_col = db["mysql_metrics"]
+node_col = db["node_metrics"]
 
-# -------------------------------------------------------------
-# 전역 변수 초기화
-# -------------------------------------------------------------
+# ============================================================
+# 모델 설정
+# ============================================================
+BASE_MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
+ADAPTER_MODEL_NAME = "DKCode9/AIOps-peft-Llama3-8B-v1"
+EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
+SCENARIO_FILE_PATH = "aiops_scenarios.txt"
+
+# 전역 객체
 tokenizer = None
 model = None
 embedding_model = None
+scenario_texts = []
+scenario_embeddings = None
 
-# -------------------------------------------------------------
-# 웹 크롤링 및 텍스트 추출 관련 함수
-# -------------------------------------------------------------
-def scrape_page_content(url: str) -> str:
-    """단일 웹 페이지에서 주요 텍스트 콘텐츠를 추출합니다."""
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # HTTP 오류 시 예외 발생
+# ============================================================
+# Alpaca 프롬프트 템플릿
+# ============================================================
+ALPACA_PROMPT_TEMPLATE = """Below is an instruction that describes a task, paired with an input that provides further context.
 
-        soup = BeautifulSoup(response.content, 'lxml')
+### Instruction:
+{}
 
-        # 본문 콘텐츠를 담고 있을 가능성이 높은 태그들을 우선적으로 탐색
-        main_content_selectors = ['main', 'article', '.content', '#content', '.post-content', '.td-content']
-        content_area = None
-        for selector in main_content_selectors:
-            content_area = soup.select_one(selector)
-            if content_area:
-                break
-        
-        if not content_area:
-            content_area = soup.body # 최후의 수단으로 body 전체 사용
+### Input:
+{}
 
-        # 불필요한 태그 제거 (nav, footer, script, style 등)
-        for tag in content_area.select('nav, footer, script, style, .sidebar, .header, .footer, .menu'):
-            tag.decompose()
+### Response:
+{}"""
 
-        # 공백이 많은 텍스트를 정리하여 반환
-        return ' '.join(content_area.get_text(separator=' ', strip=True).split())
-    except requests.RequestException as e:
-        logger.error(f"Error fetching or parsing {url}: {e}")
-        return ""
+STATIC_INSTRUCTION = (
+    "You are an AI SRE specializing in Kubernetes infrastructure. "
+    "Analyze why this situation occurred, describe automated actions, "
+    "and identify the corresponding scenario and remediation."
+)
 
-def split_text_into_chunks(text: str, chunk_size: int = 400, overlap: int = 50) -> list[str]:
-    """긴 텍스트를 단어 단위로 의미 있는 청크로 분할합니다."""
-    words = text.split()
-    if not words:
-        return []
-    
-    chunks = []
-    current_pos = 0
-    while current_pos < len(words):
-        end_pos = current_pos + chunk_size
-        chunk = words[current_pos:end_pos]
-        chunks.append(" ".join(chunk))
-        current_pos += chunk_size - overlap
-        if current_pos >= len(words):
-            break
-        
-    return chunks
+# ============================================================
+# 모델 로드 함수
+# ============================================================
+def load_models():
+    global tokenizer, model, embedding_model, scenario_texts, scenario_embeddings
 
-# -------------------------------------------------------------
-# 애플리케이션 시작 시 모델 로드
-# -------------------------------------------------------------
-def startup_event():
-    global tokenizer, model, embedding_model
+    logger.info("🚀 Loading all models and RAG data...")
+    start_time = time.time()
 
-    logger.info("Application starting... Loading models.")
-    load_start = time.time()
+    # 4bit 양자화 설정
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        llm_int8_enable_fp32_cpu_offload=True
+    )
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, 
-            dtype=torch.float32, 
-            device_map="auto"
-        )
-        logger.info(f"Successfully loaded model: '{MODEL_NAME}'")
-        load_mid = time.time()
-        logger.info(f"Model loading time: {load_mid - load_start:.2f} seconds")
+    # Base Llama 모델 로드
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_NAME,
+        token=HF_TOKEN,
+        trust_remote_code=True,
+        quantization_config=quant_config
+    )
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, token=HF_TOKEN)
+    logger.info(f"✅ Base model loaded: {BASE_MODEL_NAME}")
 
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
-        logger.info(f"Successfully loaded embedding model: '{EMBEDDING_MODEL_NAME}'")
+    # LoRA 어댑터 로드 (병합 안 함)
+    model = PeftModel.from_pretrained(base_model, ADAPTER_MODEL_NAME, token=HF_TOKEN)
+    logger.info(f"✅ LoRA adapter loaded: {ADAPTER_MODEL_NAME}")
 
-        load_end = time.time()
-        total_load_time = load_end - load_start 
-        logger.info(f"Total model loading time: {total_load_time:.2f} seconds")
+    # 임베딩 모델 로드
+    embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
+    logger.info(f"✅ Embedding model loaded: {EMBEDDING_MODEL_NAME}")
 
-    except Exception as e:
-        logger.error(f"A critical error occurred while loading models: {e}")
+    # RAG 파일 로드
+    if not os.path.exists(SCENARIO_FILE_PATH):
+        logger.error(f"❌ Scenario file not found: {SCENARIO_FILE_PATH}")
+    else:
+        with open(SCENARIO_FILE_PATH, "r", encoding="utf-8") as f:
+            scenario_texts[:] = [line.strip() for line in f if line.strip()]
+        scenario_embeddings = embedding_model.encode(scenario_texts, convert_to_tensor=False)
+        logger.info(f"✅ Loaded and encoded {len(scenario_texts)} scenarios.")
 
-# -------------------------------------------------------------
-# FastAPI 애플리케이션 설정
-# -------------------------------------------------------------
-app = FastAPI(on_startup=[startup_event])
+    logger.info(f"✅ Total load time: {time.time() - start_time:.2f}s")
 
+# ============================================================
+# RAG 검색
+# ============================================================
+def retrieve_context(query: str, top_k: int = 3):
+    if not scenario_embeddings or not scenario_texts:
+        return "No context available.", 0
+
+    query_vec = embedding_model.encode([query], convert_to_tensor=False)
+    similarities = cosine_similarity(query_vec, scenario_embeddings)
+    top_indices = np.argsort(similarities[0])[-top_k:][::-1]
+    retrieved_docs = [scenario_texts[i] for i in top_indices]
+    return "\n".join(retrieved_docs), len(scenario_texts)
+
+# ============================================================
+# FastAPI 초기화
+# ============================================================
+app = FastAPI()
+
+@app.on_event("startup")
+def on_startup():
+    load_models()
+
+# ============================================================
+# 요청 모델
+# ============================================================
 class GenerationRequest(BaseModel):
     prompt: str
 
-# -------------------------------------------------------------
-# 실시간 RAG 검색 함수
-# -------------------------------------------------------------
-def retrieve_context_from_web(query: str, top_k: int = 3) -> tuple[str, int]:
-    if embedding_model is None:
-        return "Embedding model not available.", 0
-    
-    logger.info(f"Starting real-time web crawl for query: '{query}'")
-    
-    all_chunks = []
-    for url in CRAWL_TARGET_URLS:
-        logger.info(f"Crawling: {url}")
-        content = scrape_page_content(url)
-        if content:
-            chunks = split_text_into_chunks(content)
-            all_chunks.extend(chunks)
-        time.sleep(0.2)
-    
-    if not all_chunks:
-        return "Failed to retrieve any content from the web.", 0
-
-    total_chunks = len(all_chunks)
-    logger.info(f"Crawling finished. Found {total_chunks} text chunks.")
-
-    chunk_vectors = embedding_model.encode(all_chunks, show_progress_bar=False)
-    query_vector = embedding_model.encode([query], show_progress_bar=False)
-    
-    similarities = cosine_similarity(query_vector, chunk_vectors)
-    top_k_indices = np.argsort(similarities[0])[-top_k:][::-1]
-    
-    relevant_docs = [all_chunks[i] for i in top_k_indices]
-    return " ".join(relevant_docs), total_chunks
-
-# -------------------------------------------------------------
-# API 엔드포인트
-# -------------------------------------------------------------
+# ============================================================
+# 엔드포인트
+# ============================================================
 @app.post("/generate")
 def generate_text(request: GenerationRequest):
     if not all([model, tokenizer, embedding_model]):
-        return {"error": "Models are not ready."}
+        return JSONResponse({"error": "Models not ready"}, status_code=500)
 
     try:
-        start_time = time.time()
-        retrieved_context, chunk_count = retrieve_context_from_web(request.prompt)
-        retrieval_time = time.time() - start_time
-        logger.info(f"Context retrieval took {retrieval_time:.2f} seconds.")
+        start = time.time()
+        context, _ = retrieve_context(request.prompt)
+        prompt = ALPACA_PROMPT_TEMPLATE.format(
+            STATIC_INSTRUCTION,
+            f"Problem:\n{request.prompt}\n\nContext:\n{context}",
+            ""
+        )
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-        augmented_prompt = (
-            f"Based on the following context, answer the question concisely.\n\n"
-            f"Context: {retrieved_context}\n\n"
-            f"Question: {request.prompt}\n\n"
-            f"Answer:"
+        # 스트리밍 제거 → 즉시 결과 생성
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            temperature=0.7,
+            do_sample=True,
+            use_cache=True
         )
 
-        inputs = tokenizer(augmented_prompt, return_tensors="pt").to(model.device)
-        outputs = model.generate(inputs["input_ids"], max_new_tokens=300, temperature=0.7)
-        result_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        answer_part = result_text.split("Answer:")[-1].strip()
-        
-        total_time = time.time() - start_time
-        logger.info(f"Total processing time: {total_time:.2f} seconds.")
-        
-        return {
-            "response": answer_part, 
-            "retrieved_context_summary": retrieved_context[:300] + "...", 
-            "debug_info": {
-                "total_chunks_found": chunk_count,
-                "retrieval_time_seconds": round(retrieval_time, 2),
-                "total_time_seconds": round(total_time, 2)
-            }
-        }
-        
-    except Exception as e:
-        return {"error": f"An error occurred during inference: {e}"}
+        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        logger.info(f"Generated in {time.time() - start:.2f}s")
 
+        return {"response": text.strip()}
+
+    except Exception as e:
+        logger.error(f"Error during generation: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# ============================================================
+# Health check
+# ============================================================
 @app.get("/health")
 def health_check():
-    status = "ok" if all([model, tokenizer, embedding_model]) else "error"
-    return {"status": status}
+    ok = all([model, tokenizer, embedding_model, scenario_embeddings is not None])
+    return {"status": "ok" if ok else "error"}
+
+# ============================================================
+# 비동기 MongoDB 예시
+# ============================================================
+class MetricDocumentResponse(BaseModel):
+    id: str
+    metricName: str
+    labels: Dict[str, str]
+    value: float
+    timestamp: int
+
+
+@app.get("/metrics/node/filesystem_free", response_model=List[MetricDocumentResponse])
+async def get_node_metrics(
+    mountpoint: str = Query(...),
+    limit: int = Query(10)
+):
+    query = {"metricName": "node_filesystem_free_bytes", "labels.mountpoint": mountpoint}
+    docs = await node_col.find(query).sort("timestamp", -1).to_list(limit)
+    return [
+        MetricDocumentResponse(
+            id=str(doc["_id"]),
+            metricName=doc["metricName"],
+            labels=doc["labels"],
+            value=doc["value"],
+            timestamp=doc["timestamp"]
+        )
+        for doc in docs
+    ]
+
+@app.get("/metrics/mysql/commands_total", response_model=List[MetricDocumentResponse])
+async def get_mysql_metrics(
+    command: str = Query(...),
+    limit: int = Query(10)
+):
+    query = {"metricName": "mysql_global_status_commands_total", "labels.command": command}
+    docs = await mysql_col.find(query).sort("timestamp", -1).to_list(limit)
+    return [
+        MetricDocumentResponse(
+            id=str(doc["_id"]),
+            metricName=doc["metricName"],
+            labels=doc["labels"],
+            value=doc["value"],
+            timestamp=doc["timestamp"]
+        )
+        for doc in docs
+    ]

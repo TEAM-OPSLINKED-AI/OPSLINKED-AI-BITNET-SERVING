@@ -1,13 +1,33 @@
+#PyTorch CPU 버전을 위한 인덱스 URL 설정
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+#FastAPI 서버
 fastapi
 uvicorn
-# CPU-only PyTorch for minimal size and resource usage
-torch --index-url https://download.pytorch.org/whl/cpu
+pydantic
+dotenv
+
+#LLM
+torch
 transformers
 accelerate
-# RAG를 위해 추가된 라이브러리
+peft
+huggingface_hub
+#양자화
+bitsandbytes
+
+#RAG - 임베딩 및 유사도 계산
 sentence-transformers
 scikit-learn
 numpy
-requests
-beautifulsoup4
-lxml
+motor
+
+#데이터베이스
+pymongo
+
+#autoencoder
+tensorflow
+pandas
+scikit-learn
+matplotlib
+joblib

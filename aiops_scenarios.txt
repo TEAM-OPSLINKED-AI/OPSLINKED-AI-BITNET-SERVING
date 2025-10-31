@@ -1,0 +1,286 @@
+AIOps Scenarios for opslinked-ai
+
+Part 1: Server AIOps Scenarios
+
+Server-related issues have the most direct operational impact as they can immediately lead to application performance degradation or complete outages. The scenarios in this section cover key compute resource issues that can arise in both the infrastructure (K8s nodes) and application workloads (Pods).
+
+When analyzing these problems, it's crucial to distinguish between observed phenomena and root causes. For example, a Pod entering a CrashLoopBackOff state (Scenario 1.4) is just a symptom; the root cause could be insufficient memory leading to OOMKilled (Scenario 1.2), a configuration error, or a failure to connect to a dependent service (Scenario 3.1). An intelligent AIOps platform like opslinked-ai must be able to correlate these individual events to infer the root cause. This forms the basis for future advanced analysis by the BitNet LLM, such as associating CrashLoopBackOff logs with preceding OOMKilled events to identify a memory leak as the root cause.
+
+Furthermore, there is a significant difference between reactive measures (responding after a failure occurs) and proactive measures (preventing failures). For instance, restarting an OOMKilled Pod is a reactive measure. In contrast, detecting that JVM heap usage is reaching a threshold (Scenario 1.3) and proactively restarting the pod during low traffic times before a failure occurs is a mature AIOps strategy that minimizes user impact.
+
+1.1. K8s Node CPU Usage Threshold Exceeded
+
+Description: A Kubernetes worker node's CPU utilization consistently exceeds a threshold (e.g., 90%), causing performance degradation for all Pods running on that node.
+
+Detection Targets (Metrics/Logs):
+
+Use the node_cpu_seconds_total metric from Node Exporter. Example PromQL query:
+100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+
+Automated Action (Remediation):
+
+As an initial response, cordon the node to prevent new Pods from being scheduled on it and notify the operator: kubectl cordon <node-name>
+
+Testing Method:
+
+Deploy a CPU stress testing tool like k8s-pod-cpu-stressor as a DaemonSet to apply CPU load to a specific node or all nodes.
+
+1.2. Pod Memory Exhaustion and OOMKilled
+
+Description: A container within a Pod attempts to use more memory than its configured limit, causing it to be forcefully terminated (OOMKilled) by Kubernetes.
+
+Detection Targets (Metrics/Logs):
+
+Search logs collected in Elasticsearch for keywords like "OOMKilled" or "Exit Code 137".
+
+Monitor Kubernetes events for reason: OOMKilled.
+
+Automated Action (Remediation):
+
+Kubernetes automatically restarts the Pod, but the root cause (usually a memory leak) is not resolved. The AIOps system should detect recurring OOMKilled events for the same deployment within a short timeframe (e.g., 3 times within 1 hour) as a pattern and send a high-priority alert to the development team.
+
+Testing Method:
+
+Deploy a simple application that allocates memory in an infinite loop until it exceeds the container's memory limit. Chaos engineering tools like Gremlin can also be used to forcefully allocate a specific amount of memory for testing.
+
+1.3. Spring Boot JVM Heap Memory Pressure
+
+Description: A Spring Boot application Pod's JVM heap memory usage is approaching its maximum, indicating a potential memory leak or an impending OOM event. This is a proactive scenario for preventing failures.
+
+Detection Targets (Metrics/Logs):
+
+Use JVM metrics from Spring Boot Actuator. Example PromQL query:
+jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"} > 0.9
+
+Automated Action (Remediation):
+
+Before an OOM crash occurs, gracefully restart the affected Pod to reclaim memory: kubectl rollout restart deployment/[deployment-name]
+
+Testing Method:
+
+Use a load testing tool like JMeter to send a large number of requests to an API endpoint that continuously creates objects in memory, simulating a gradual memory leak.
+
+1.4. Pod in CrashLoopBackOff State
+
+Description: A Pod repeatedly starts, crashes, and restarts, indicating a persistent startup failure.
+
+Detection Targets (Metrics/Logs):
+
+Monitor the status of Kubernetes Pods. Detect cases where the status.containerStatuses.state.waiting.reason field is CrashLoopBackOff using kube-state-metrics.
+
+Logs from the previous container termination are essential for diagnosis.
+
+Automated Action (Remediation):
+
+This state is often caused by configuration errors (incorrect environment variables, missing ConfigMap) or dependency failures, making automatic recovery risky. The AIOps system should generate a high-priority alert for the operator and automatically attach the logs from the previous container (kubectl logs <pod-name> --previous) to the alert to assist in rapid analysis.
+
+Testing Method:
+
+Deploy an application with an incorrect startup command (e.g., trying to execute a non-existent file) or configure the application to exit with an error code immediately upon startup.
+
+1.5. High HTTP 5xx Server Error Rate
+
+Description: A Spring Boot application starts returning an abnormally high rate of HTTP 5xx (server-side error) responses, indicating a backend failure.
+
+Detection Targets (Metrics/Logs):
+
+Use the http_server_requests_seconds_count metric from Spring Boot Actuator. Calculate the error rate using a PromQL query:
+sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m])) / sum(rate(http_server_requests_seconds_count[5m])) > 0.1 (10% error rate threshold)
+
+Automated Action (Remediation):
+
+As a general first response to transient application bugs, perform a rolling restart of the affected deployment: kubectl rollout restart deployment/[deployment-name]
+
+Testing Method:
+
+Create a test endpoint in the application that intentionally throws an unhandled exception (triggering a 500 error) when called with a specific query parameter (e.g., ?forceError=true). Use a load testing tool to repeatedly call this endpoint.
+
+Part 2: Storage AIOps Scenarios
+
+Storage-related problems often manifest gradually as performance degradation before potentially leading to critical failures like data loss or node instability. This section covers issues related to data persistence, disk I/O, and log management.
+
+Storage issues in Kubernetes are clearly divided into two types. First are problems occurring on the node's ephemeral filesystem (nodefs), and second are problems occurring on PersistentVolumes attached to applications. Node disk pressure (Scenario 2.1) is typically caused by log or container image accumulation and affects the entire node. Conversely, PV exhaustion (Scenario 2.2) only affects the specific application using that volume. An AIOps system must utilize different data sources like Node Exporter and kube-state-metrics to accurately distinguish these two situations and take appropriate action. For example, attempting to delete application data stored on a PV when the node's root disk is full would be a very dangerous malfunction.
+
+Furthermore, 'storage' problems are not limited to just disk space shortages. Application logs are not only debugging tools but also important operational management targets. Excessive log generation (Scenario 2.3) can directly cause node disk pressure. Slow database queries (Scenario 2.5) are also an example of storage I/O performance impacting the application layer. Therefore, an effective AIOps platform must have an integrated storage monitoring strategy that considers both capacity (disk space) and performance (I/O, log volume).
+
+2.1. Node Disk Exhaustion due to Insufficient Application Log Rotation
+
+Description: An application's log file on a K8s node (host machine) grows indefinitely due to the absence or misconfiguration of a policy like logrotate. This exhausts space on the /var/log partition or the entire root filesystem, potentially causing node instability and Pod evictions.
+
+Detection Targets (Metrics/Logs):
+
+(Primary Detection) Monitor the node_filesystem_avail_bytes{mountpoint="/"} metric from Node Exporter, triggering when it drops below a threshold (e.g., 15% of total space).
+
+(Root Cause Analysis) The AIOps system identifies that a specific log file (e.g., /var/log/my-app.log) within /var/log is abnormally large, perhaps using a command similar to du -sh /var/log/*.
+
+Automated Action (Remediation):
+
+(Step 1: Emergency Action) Immediately compress (gzip) the identified large log file or delete a portion of it (e.g., the oldest 1 million lines) based on predefined policy to quickly free up space.
+
+(Step 2: Root Cause Action) Force the logrotate configuration for the affected application: logrotate -f /etc/logrotate.d/my-app-config
+
+(Step 3: Notification) Send an alert to the operator specifying the cause and actions taken, e.g., "Disk threshold exceeded due to poor rotation of /var/log/my-app.log. Compressed file and forced logrotate."
+
+Testing Method:
+
+Log into a specific node and run the command yes "This is a log spam line to test disk full scenario" | tee -a /var/log/spam-app.log in the shell. This command writes text indefinitely to spam-app.log, rapidly increasing its size.
+
+2.2. Persistent Volume (PV) Usage Threshold Exceeded
+
+Description: A Persistent Volume attached to a stateful application (like MySQL) is nearly full, creating a risk of data loss and application failure.
+
+Detection Targets (Metrics/Logs):
+
+Requires kube-state-metrics which provides Kubernetes object metrics. Example PromQL query: kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > 0.9
+
+Automated Action (Remediation):
+
+Due to the importance of the data, automatic recovery is risky. The system should send a high-priority alert to the database administrator. If the underlying StorageClass supports volume expansion, advanced automation logic could be implemented to automatically resize the PVC.
+
+Testing Method:
+
+Deploy a Pod with a PVC mounted. Use kubectl exec to access the Pod and create a large file in the mounted path using the dd command to simulate data growth.
+
+2.3. Application Log Flood
+
+Description: A specific application Pod generates an abnormally large volume of logs, overwhelming the logging pipeline (Fluentd/Logstash) and Elasticsearch, and potentially causing node disk pressure in severe cases.
+
+Detection Targets (Metrics/Logs):
+
+Aggregate the volume of logs collected per Pod in Elasticsearch over a specific time window (e.g., 5 minutes). Detect when this value increases sharply compared to its usual baseline.
+
+Automated Action (Remediation):
+
+The safest action is to alert the development team. A more active measure could involve dynamically changing the application's logging level via kubectl exec (e.g., from DEBUG to WARN) to reduce log volume.
+
+Testing Method:
+
+Create a simple application with an API endpoint that, when called, outputs thousands of log messages per second to standard output (stdout).
+
+2.4. Node Filesystem Read-Only Error
+
+Description: A severe situation where a node's filesystem unexpectedly becomes read-only due to storage errors or disk corruption. All write operations, including writing temporary files, will fail.
+
+Detection Targets (Metrics/Logs):
+
+Detect when the node_filesystem_readonly metric from Node Exporter becomes 1.
+
+Search Elasticsearch logs for error messages like "Read-only file system".
+
+Automated Action (Remediation):
+
+This is a critical node failure. Immediately cordon and drain the node to migrate workloads to healthy nodes, then send an emergency alert to the infrastructure team: kubectl drain <node-name> --ignore-daemonsets
+
+Testing Method:
+
+In a controlled test environment node, manually run the command sudo mount -o remount,ro / to force the filesystem into a read-only state.
+
+2.5. MySQL Slow Query Detection
+
+Description: The MySQL database executes queries that take an excessively long time, degrading the overall performance of connected applications.
+
+Detection Targets (Metrics/Logs):
+
+The mysql_global_status_slow_queries metric from MySQL Exporter is a counter that increments for each slow query. Its rate of increase can be used for detection. Example PromQL query: rate(mysql_global_status_slow_queries[5m]) > 0.
+
+For more detailed analysis, MySQL's slow query log file can be collected into Elasticsearch for analysis.
+
+Automated Action (Remediation):
+
+Since the AIOps system cannot modify queries directly, its primary role is to send alerts with metric trends to the database administrator and relevant application teams to prompt human intervention.
+
+Testing Method:
+
+Connect to MySQL and intentionally execute a slow query. For example, run SELECT SLEEP(10); when the long_query_time setting is less than 10 seconds. This will increment the slow query counter.
+
+Part 3: Network AIOps Scenarios
+
+The network is like the nervous system connecting the components of a microservices architecture. Network problems are often transient, occurring intermittently during interactions between multiple services, making them one of the most challenging areas to diagnose manually.
+
+Network failures can occur at various layers, and an AIOps system needs data sources to observe each layer. For example, 'Connection Refused' (Scenario 3.1) is an application layer (L7) issue, typically logged by the client application. In contrast, a high packet drop rate (Scenario 3.2) is a lower-layer (L2/L3) problem occurring at the node's network interface, detected via Node Exporter. DNS lookup delays (Scenario 3.3) are a problem at the cluster's core service layer. opslinked-ai should be designed to comprehensively analyze signals collected from these various layers to pinpoint the true cause of network failures.
+
+Furthermore, when inter-service communication fails, it's important to distinguish whether the problem lies with the client, the server, or the infrastructure in between. For instance, if only one client Pod logs 'Connection Refused' errors, the issue is likely with that client Pod. However, if all client Pods calling a specific service start logging errors simultaneously, the problem is more likely with the target service or the network path to it. By analyzing the 'scope' of the failure in this way, the AIOps system can narrow down the potential causes, a powerful capability enabled by integrating and analyzing metrics and logs from multiple sources.
+
+3.1. Internal Cluster Service Connection Refused
+
+Description: A client Pod receives a "Connection Refused" error when attempting to call another service within the cluster. This implies the target Pod is not running or not listening on the specified port.
+
+Detection Targets (Metrics/Logs):
+
+Search client application logs in Elasticsearch for patterns like "Connection refused" or "ConnectException".
+
+Automated Action (Remediation):
+
+The most direct solution is to restart the Pods of the target service experiencing issues. For example, if service-A gets an error calling service-B, the action would be kubectl rollout restart deployment/service-b.
+
+Testing Method:
+
+Temporarily scale down all Pods of the target service: kubectl scale deployment/service-b --replicas=0. Alternatively, deploy the server application configured to listen on a different port than the one defined in the Kubernetes Service.
+
+3.2. High Network Packet Drop Rate on Node
+
+Description: A large number of incoming or outgoing packets are being lost at a node's network interface, suggesting network saturation, hardware faults, or driver issues.
+
+Detection Targets (Metrics/Logs):
+
+Use network-related metrics from Node Exporter. Example PromQL query:
+rate(node_network_receive_drop_total[5m]) > 10 or rate(node_network_transmit_drop_total[5m]) > 10
+
+Automated Action (Remediation):
+
+This indicates a low-level infrastructure problem. Cordon and drain the suspect node to migrate workloads away from it, and send an emergency alert to the infrastructure team.
+
+Testing Method:
+
+Inside a privileged Pod, use Linux tc (traffic control) commands to artificially inject packet loss on the node's network interface.
+
+3.3. High DNS Lookup Latency
+
+Description: DNS resolution within the cluster (usually handled by CoreDNS) becomes slow, causing delays for all applications trying to connect to other services via their service names.
+
+Detection Targets (Metrics/Logs):
+
+Direct measurement is difficult. Can be inferred indirectly through a surge in the http_client_requests_seconds metric from Spring Boot Actuator for new connection requests involving DNS lookups. A more accurate method is to run a dedicated 'blackbox' Pod that periodically tests DNS lookups and exposes the timing as a metric.
+
+Automated Action (Remediation):
+
+A common solution for transient CoreDNS issues is to perform a rolling restart of the CoreDNS deployment: kubectl rollout restart deployment/coredns -n kube-system
+
+Testing Method:
+
+Use a DNS load testing tool like dnsperf to send a high volume of queries to the CoreDNS service IP, causing overload and increasing response times.
+
+3.4. High Ingress Traffic Latency
+
+Description: The time taken to process incoming external requests and receive a response increases significantly, negatively impacting user experience.
+
+Detection Targets (Metrics/Logs):
+
+Use the http_server_requests_seconds metric from Spring Boot Actuator. Calculate the 95th percentile (p95) latency using PromQL and alert if it exceeds a threshold:
+histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket[5m])) by (le)) > 2 (2-second threshold)
+
+Automated Action (Remediation):
+
+The bottleneck could be the Ingress controller, a service, the database, etc. If the Ingress controller Pods show high resource usage, restarting them might be a simple automated action. The primary action is usually to notify an operator.
+
+Testing Method:
+
+Use an external load testing tool (e.g., JMeter) to send a large volume of traffic to the application's public endpoint, simulating increased latency.
+
+3.5. Database Connection Pool Exhaustion
+
+Description: The application exhausts all connections in its database connection pool, failing to handle new requests that require database lookups and causing timeouts.
+
+Detection Targets (Metrics/Logs):
+
+Detect error messages like "Timeout waiting for connection from pool" in application logs.
+
+Monitor the mysql_global_status_threads_connected metric from MySQL Exporter to see if it approaches the configured max_connections.
+
+Automated Action (Remediation):
+
+The immediate fix, often due to connection leak bugs, is to restart the application Pods holding the connections, thus returning all connections to the pool: kubectl rollout restart deployment/[app-deployment-name]p
+
+Testing Method:
+
+Create a test endpoint in the application that acquires a database connection but intentionally does not release it
