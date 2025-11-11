@@ -4,8 +4,10 @@ source ./venv/Scripts/activate
 
 pip install -r requirements.txt
 
+#set HF_TOKEN=hf_your_token_here
+
 # 로컬 환경 FastAPI 실행
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 8000
 
 curl -X POST "http://localhost:8000/generate" \
      -H "Content-Type: application/json" \

@@ -38,6 +38,4 @@ $ curl -X POST "http://localhost:8000/generate" \
       "total_time_seconds":14.12
    }
 }
-
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
-.\.venv\Scripts\activate
+docker run -d -p 8000:8000 -e HF_TOKEN="hf_your_token_here" aiops-llm-server
