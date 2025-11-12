@@ -1,13 +1,24 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch
 fastapi
 uvicorn
-# CPU-only PyTorch for minimal size and resource usage
-torch --index-url https://download.pytorch.org/whl/cpu
-transformers
-accelerate
-# RAG를 위해 추가된 라이브러리
+pydantic
+pymongo
+
+# === 모델 로딩 및 임베딩 ===
+huggingface_hub
 sentence-transformers
-scikit-learn
+llama-cpp-python==0.2.84
+
+# === RAG 관련 ===
+langchain==0.2.17
+langchain-core==0.2.43
+langchain-community==0.2.17
+langchain-text-splitters==0.2.2
+faiss-cpu
+
+# === 유틸 ===
+tqdm
 numpy
-requests
-beautifulsoup4
-lxml
+transformers==4.57.1
